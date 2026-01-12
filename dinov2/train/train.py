@@ -1257,6 +1257,360 @@ def do_train(cfg, model, resume=False):
     metric_logger.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+def bench_model_training(cfg, model, resume=False):
+    model.train()
+    inputs_dtype = torch.half
+    fp16_scaler = model.fp16_scaler  # for mixed precision training
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    if cfg.train.skip_checkpointer or True:
+        print(f"\n\nSkipping FSDP checkpointer (cfg.train.skip_checkpointer={cfg.train.skip_checkpointer})\n\n")
+
+    # setup optimizer
+
+    optimizer = build_optimizer(cfg, model.get_params_groups())
+    (
+        lr_schedule,
+        wd_schedule,
+        momentum_schedule,
+        teacher_temp_schedule,
+        last_layer_lr_schedule,
+    ) = build_schedulers(cfg)
+    
+    from omegaconf import OmegaConf
+    if distributed.is_main_process():
+        # run_id_path = Path(cfg.train.output_dir) / "wandb_run_id.txt"
+        # if resume and run_id_path.exists():
+        #     run_id = run_id_path.read_text().strip()
+        #     resume_mode = "must"
+        # else:
+        #     run_id_path.parent.mkdir(parents=True, exist_ok=True)
+        #     run_id = wandb.util.generate_id()
+        #     run_id_path.write_text(run_id)
+        #     resume_mode = "allow"
+        # run = wandb.init(
+        #     project="tcga-finetuning",
+        #     config=OmegaConf.to_container(cfg),
+        #     id=run_id,
+        #     resume=resume_mode,
+        # )
+        repo_root = Path(__file__).resolve().parents[2]
+        files_to_save = [
+            Path(__file__).resolve(),
+            AUGMENTATION_FILE,
+            VISION_TRANSFORMER_FILE,
+            SSL_META_ARCH,
+            Path(CONFIG_FILE_PATH),
+        ]
+        run_script = os.environ.get("DINOV2_RUN_SCRIPT")
+        if run_script:
+            files_to_save.append(Path(run_script).resolve())
+        for src in files_to_save:
+            base_path = repo_root if src.is_relative_to(repo_root) else src.parent
+            # run.save(str(src), base_path=str(base_path), policy="now")
+        logger.info("Trainable parameters: %s", trainable_params)
+        logger.info("Total parameters: %s", total_params)
+        print(f"Trainable parameters: {trainable_params}")
+        print(f"Total parameters: {total_params}")
+
+    # checkpointer
+    if not cfg.train.skip_checkpointer:
+        checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+        start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+    else:
+        start_iter = 0
+
+    OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
+    max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    early_stop_iter = cfg.optim.early_stop * OFFICIAL_EPOCH_LENGTH
+    eta_target_iter = min(max_iter, early_stop_iter)
+
+    if not cfg.train.skip_checkpointer and False:
+        periodic_checkpointer = PeriodicCheckpointer(
+            checkpointer,
+            period=3 * OFFICIAL_EPOCH_LENGTH,
+            max_iter=max_iter,
+            max_to_keep=3,
+        )
+
+    # setup data preprocessing
+
+    img_size = cfg.crops.global_crops_size
+    patch_size = cfg.student.patch_size
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
+    )
+
+    data_transform = DataAugmentationDINO(
+        cfg.crops.global_crops_scale,
+        cfg.crops.local_crops_scale,
+        cfg.crops.local_crops_number,
+        global_crops_size=cfg.crops.global_crops_size,
+        local_crops_size=cfg.crops.local_crops_size,
+    )
+
+    collate_fn = partial(
+        collate_data_and_cast,
+        mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
+        mask_probability=cfg.ibot.mask_sample_probability,
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+        dtype=inputs_dtype,
+    )
+
+    # setup data loader
+
+    if cfg.train.streaming_from_hf and False:
+        dataset_builder = partial(
+            _build_streaming_dataset,
+            dataset_path=str(cfg.train.streaming_dataset_path),
+            shuffle_buffer=50000,                   
+            base_seed=42, 
+        )
+
+        def decode_and_transform(item):
+            image = Image.open(BytesIO(item["image_bytes"]))
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            transformed = data_transform(image)
+            slide_meta = (item["slide_path"], item["x"], item["y"], item["level"])
+            return (transformed, None), slide_meta
+
+        class _TransformedStreamingDataset(torch.utils.data.IterableDataset):
+            def __init__(self, dataset_builder, transform, samples_per_epoch=None, reshuffle_every=0):
+                self._dataset_builder = dataset_builder
+                self._transform = transform
+                self._samples_per_epoch = samples_per_epoch
+                self._reshuffle_every = reshuffle_every  
+                self._initialized = False
+                self._epoch_seen = 0
+                self._src_iter = None
+
+            def _init_or_reshuffle(self, *, force: bool = False):
+                if force or (not self._initialized) or (
+                    self._reshuffle_every and (self._epoch_seen % self._reshuffle_every == 0)
+                ):
+                    src = self._dataset_builder(epoch=self._epoch_seen if self._reshuffle_every else 0)
+                    worker_info = torch.utils.data.get_worker_info()
+                    if worker_info is not None and worker_info.num_workers > 1:
+                        src = src.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+                    self._src_iter = iter(src)
+                    self._initialized = True
+
+            def __iter__(self):
+                while True:
+                    self._init_or_reshuffle()
+
+                    # Per-RANK quota
+                    rank_quota = self._samples_per_epoch or (1 << 62)
+
+                    worker_info = torch.utils.data.get_worker_info()
+                    num_workers = worker_info.num_workers if worker_info is not None else 1
+                    worker_id = worker_info.id if worker_info is not None else 0
+
+                    # Split quota across workers (nearly even split)
+                    base = rank_quota // num_workers
+                    remainder = rank_quota % num_workers
+                    local_quota = base + (1 if worker_id < remainder else 0)
+
+                    produced = 0
+                    while produced < local_quota:
+                        try:
+                            sample = next(self._src_iter)
+                        except StopIteration:
+                            # Refill the iterator; only reshuffle on epoch boundaries
+                            self._init_or_reshuffle(force=True)
+                            continue
+                        yield self._transform(sample)
+                        produced += 1
+
+                    self._epoch_seen += 1
+
+        # Define explicit per-epoch sample budget per rank to keep ranks in lock-step
+        samples_per_epoch = cfg.train.batch_size_per_gpu * cfg.train.OFFICIAL_EPOCH_LENGTH
+        dataset = _TransformedStreamingDataset(
+            dataset_builder,
+            decode_and_transform,
+            samples_per_epoch=samples_per_epoch,
+        )
+
+        def _worker_init(_):
+            torch.set_num_threads(1)
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            drop_last=True,
+            pin_memory=True,
+            persistent_workers=True,
+            collate_fn=collate_fn,
+            prefetch_factor=4,
+            worker_init_fn=_worker_init,
+        )
+    else:
+        from dinov2.data import SamplerType, make_data_loader, make_dataset
+        sample_list_path = str(cfg.train.sample_list_path)
+        if not sample_list_path:
+            raise ValueError("cfg.train.sample_list_path must be set when streaming_from_hf is False")
+        dataset_str = f"pathology:root=/data/TCGA/:sample_list_path={sample_list_path}"
+        dataset = make_dataset(
+            dataset_str=dataset_str,
+            transform=data_transform,
+            target_transform=lambda _: (),
+        )
+        sampler_type = SamplerType.SHARDED_INFINITE
+        data_loader = make_data_loader(
+            dataset=dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            shuffle=True,
+            seed=0,
+            sampler_type=sampler_type,
+            sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+            drop_last=True,
+            collate_fn=collate_fn,
+        )
+
+    # training loop
+
+    iteration = start_iter
+
+    logger.info("Starting training from iteration {}".format(start_iter))
+    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+    header = "Training"
+    batches=[]
+    logger.info("Starting caching batches")
+    for count,data in enumerate(data_loader):
+        batches.append(data)
+        if count >100:
+            break
+    logger.info("Batch caching is done")
+    class MemDataLoader:
+        def __init__(self,data,rank=0) -> None:
+            self.data=data
+            self.rank=rank
+            self.index=rank%len(data)
+        def __iter__(self):
+            return self
+        def __next__(self):
+            val=self.data[self.index]
+            self.index=(self.index+1)%len(self.data)
+            return val
+    
+    for data in metric_logger.log_every(
+        MemDataLoader(batches,torch.distributed.get_rank()),
+        10,
+        header,
+        eta_target_iter + 1,
+        start_iter,
+    ):
+        if iteration >= early_stop_iter:
+            logger.info("Early stopping at iteration {}".format(iteration))
+            if cfg.evaluation.eval_period_iterations >= 0:
+                do_test(cfg, model, f"training_{iteration}")
+                torch.cuda.synchronize()
+            # if not cfg.train.skip_checkpointer:
+            #     checkpointer.save(f"model_{iteration:07d}", iteration=iteration)
+            break
+
+        #Save instantly
+        if cfg.evaluation.eval_period_iterations >= 0 and (iteration) % cfg.evaluation.eval_period_iterations == 0:
+            do_test(cfg, model, f"training_{iteration}")
+            torch.cuda.synchronize()
+        # if not cfg.train.skip_checkpointer:
+        #     periodic_checkpointer.step(iteration)
+        
+        current_batch_size = data["collated_global_crops"].shape[0] / 2
+        if iteration > max_iter:
+            return
+        
+        nan_mask = torch.isnan(data["collated_global_crops"])
+        nan_mask2 = torch.isnan(data["collated_local_crops"])
+        if nan_mask.any():
+            print("found nan in input data")
+            print(data[indexes])
+        
+
+        # apply schedules
+
+        lr = lr_schedule[iteration]
+        wd = wd_schedule[iteration]
+        mom = momentum_schedule[iteration]
+        teacher_temp = teacher_temp_schedule[iteration]
+        last_layer_lr = last_layer_lr_schedule[iteration]
+        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+
+        # compute losses
+
+        optimizer.zero_grad(set_to_none=True)
+
+        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
+
+        # clip gradients
+
+        if fp16_scaler is not None:
+            if cfg.optim.clip_grad:
+                fp16_scaler.unscale_(optimizer)
+                for v in model.student.values():
+                    v.clip_grad_norm_(cfg.optim.clip_grad)
+            fp16_scaler.step(optimizer)
+            fp16_scaler.update()
+        else:
+            if cfg.optim.clip_grad:
+                for v in model.student.values():
+                    v.clip_grad_norm_(cfg.optim.clip_grad)
+            optimizer.step()
+
+        # perform teacher EMA update
+
+        model.update_teacher(mom)
+
+        # logging
+
+        if distributed.get_global_size() > 1:
+            for v in loss_dict.values():
+                torch.distributed.all_reduce(v)
+        loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
+
+        if math.isnan(sum(loss_dict_reduced.values())):
+            print(sum(loss_dict_reduced.values()))
+            logger.info("NaN detected")
+            print(data["indexes"])
+            
+            for name, param in model.named_parameters():
+                if torch.isnan(param.data).any():
+                    print(f"NaNs found in parameter: {name}")
+
+            raise AssertionError
+        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+
+        metric_logger.update(lr=lr)
+        metric_logger.update(wd=wd)
+        metric_logger.update(mom=mom)
+        metric_logger.update(last_layer_lr=last_layer_lr)
+        metric_logger.update(current_batch_size=current_batch_size)
+        metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
+        
+        if distributed.is_main_process():
+            scalar_logs = {
+                "Learning Rate": lr,
+                "Momentum": mom,
+                "Last Layer LR": last_layer_lr,
+                "Total Loss": losses_reduced,
+            }
+            wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
+    
+        # Synchronize the GPU to ensure all operations are complete before measuring
+        torch.cuda.synchronize()
+
+        iteration = iteration + 1
+    metric_logger.synchronize_between_processes()
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
 def bench_data_pipeline(cfg,  resume=False):
     # model.train()
     inputs_dtype = torch.half
@@ -1559,25 +1913,25 @@ def bench_data_pipeline(cfg,  resume=False):
 def main(args):
     cfg = setup(args)
     print(cfg)
-    # model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    #Load model here from pretrained.
-    # if cfg.train.use_pretrained:
-    #     _load_pretrained_backbone(cfg, model)
-    # _freeze_student_backbone_except_last_n(cfg, model)
+    model = SSLMetaArch(cfg).to(torch.device("cuda"))
+    # Load model here from pretrained.
+    if cfg.train.use_pretrained:
+        _load_pretrained_backbone(cfg, model)
+    _freeze_student_backbone_except_last_n(cfg, model)
 
-    # model.prepare_for_distributed_training()
-    # logger.info("Model:\n{}".format(model))
+    model.prepare_for_distributed_training()
+    logger.info("Model:\n{}".format(model))
 
-    # if args.eval_only and not cfg.train.skip_checkpointer:
-    #     iteration = (
-    #         FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
-    #         .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
-    #         .get("iteration", -1)
-    #         + 1
-    #     )
-    #     return do_test(cfg, model, f"manual_{iteration}")
+    if args.eval_only and not cfg.train.skip_checkpointer:
+        iteration = (
+            FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
+            .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
+            .get("iteration", -1)
+            + 1
+        )
+        return do_test(cfg, model, f"manual_{iteration}")
 
-    bench_data_pipeline(cfg, resume=False)
+    bench_model_training(cfg, model,resume=False)
 
 
 if __name__ == "__main__":
