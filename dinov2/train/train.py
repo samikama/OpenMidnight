@@ -1857,47 +1857,11 @@ def bench_data_pipeline(cfg,  resume=False):
             print("found nan in input data")
             print(data[indexes])
         
-
-        # logging
-
-        # if distributed.get_global_size() > 1:
-        #     for v in loss_dict.values():
-        #         torch.distributed.all_reduce(v)
-        # loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
-
-        # if math.isnan(sum(loss_dict_reduced.values())):
-        #     print(sum(loss_dict_reduced.values()))
-        #     logger.info("NaN detected")
-        #     print(data["indexes"])
-            
-        #     for name, param in model.named_parameters():
-        #         if torch.isnan(param.data).any():
-        #             print(f"NaNs found in parameter: {name}")
-
-        #     raise AssertionError
-        # losses_reduced = sum(loss for loss in loss_dict_reduced.values())
-
-        # metric_logger.update(lr=lr)
-        # metric_logger.update(wd=wd)
-        # metric_logger.update(mom=mom)
-        # metric_logger.update(last_layer_lr=last_layer_lr)
+        #time.sleep(0.7)
         metric_logger.update(current_batch_size=current_batch_size)
         times.append(time.perf_counter())
-        if iteration>10000:
+        if iteration>500:
             break
-        # metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
-        
-        # if distributed.is_main_process():
-            # scalar_logs = {
-            #     "Learning Rate": lr,
-            #     "Momentum": mom,
-            #     "Last Layer LR": last_layer_lr,
-            #     "Total Loss": losses_reduced,
-            # }
-            # wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
-    
-        # Synchronize the GPU to ensure all operations are complete before measuring
-        # torch.cuda.synchronize()
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
@@ -1913,26 +1877,28 @@ def bench_data_pipeline(cfg,  resume=False):
 def main(args):
     cfg = setup(args)
     print(cfg)
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    # Load model here from pretrained.
-    if cfg.train.use_pretrained:
-        _load_pretrained_backbone(cfg, model)
-    _freeze_student_backbone_except_last_n(cfg, model)
+    bench_model=False
+    if bench_model:
+        model = SSLMetaArch(cfg).to(torch.device("cuda"))
+        # Load model here from pretrained.
+        if cfg.train.use_pretrained:
+            _load_pretrained_backbone(cfg, model)
+        _freeze_student_backbone_except_last_n(cfg, model)
 
-    model.prepare_for_distributed_training()
-    logger.info("Model:\n{}".format(model))
+        model.prepare_for_distributed_training()
+        logger.info("Model:\n{}".format(model))
 
-    if args.eval_only and not cfg.train.skip_checkpointer:
-        iteration = (
-            FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
-            .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
-            .get("iteration", -1)
-            + 1
-        )
-        return do_test(cfg, model, f"manual_{iteration}")
-
-    bench_model_training(cfg, model,resume=False)
-
+        if args.eval_only and not cfg.train.skip_checkpointer:
+            iteration = (
+                FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
+                .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
+                .get("iteration", -1)
+                + 1
+            )
+            return do_test(cfg, model, f"manual_{iteration}")
+        bench_model_training(cfg, model,resume=False)
+    else:
+        bench_data_pipeline(cfg, resume=False)
 
 if __name__ == "__main__":
     args = get_args_parser(add_help=True).parse_args()
