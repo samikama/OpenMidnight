@@ -1498,7 +1498,7 @@ def bench_model_training(cfg, model, resume=False):
             return self
         def __next__(self):
             val=self.data[self.index]
-            self.index=(self.index+1)%len(self.data)
+            self.index=(self.index+self.rank)%len(self.data)
             return val
     
     for data in metric_logger.log_every(
@@ -1602,7 +1602,7 @@ def bench_model_training(cfg, model, resume=False):
                 "Last Layer LR": last_layer_lr,
                 "Total Loss": losses_reduced,
             }
-            wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
+            # wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring
         torch.cuda.synchronize()
