@@ -1486,7 +1486,7 @@ def bench_model_training(cfg, model, resume=False):
     logger.info("Starting caching batches")
     for count,data in enumerate(data_loader):
         batches.append(data)
-        if count >100:
+        if count >307:
             break
     logger.info("Batch caching is done")
     class MemDataLoader:
@@ -1500,7 +1500,7 @@ def bench_model_training(cfg, model, resume=False):
             val=self.data[self.index]
             self.index=(self.index+self.rank)%len(self.data)
             return val
-    
+    times=[]
     for data in metric_logger.log_every(
         MemDataLoader(batches,torch.distributed.get_rank()),
         10,
@@ -1606,8 +1606,17 @@ def bench_model_training(cfg, model, resume=False):
     
         # Synchronize the GPU to ensure all operations are complete before measuring
         torch.cuda.synchronize()
-
+        if iteration>500:
+            break
         iteration = iteration + 1
+        times.append(time.perf_counter())
+    step_times=np.diff(times[50:]) #skip first 10 entries for pipeline fill
+
+    print("Rank {r} time stats: avg= {avg} +/- {std}".format(
+        avg=np.mean(step_times), 
+        std=np.std(step_times),
+        r=torch.distributed.get_rank()))
+    
     metric_logger.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -1838,7 +1847,7 @@ def bench_data_pipeline(cfg,  resume=False):
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
     header = "Training"
-    times=[time.perf_counter()]
+    times=[]
     for data in metric_logger.log_every(
         data_loader,
         10,
@@ -1860,12 +1869,12 @@ def bench_data_pipeline(cfg,  resume=False):
         #time.sleep(0.7)
         metric_logger.update(current_batch_size=current_batch_size)
         times.append(time.perf_counter())
-        if iteration>500:
+        if iteration>550:
             break
 
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
-    step_times=np.diff(times)
+    step_times=np.diff(times[50:]) #skip first 10 entries for pipeline fill
 
     print("Rank {r} time stats: avg= {avg} +/- {std}".format(
         avg=np.mean(step_times), 
@@ -1877,7 +1886,7 @@ def bench_data_pipeline(cfg,  resume=False):
 def main(args):
     cfg = setup(args)
     print(cfg)
-    bench_model=False
+    bench_model=True
     if bench_model:
         model = SSLMetaArch(cfg).to(torch.device("cuda"))
         # Load model here from pretrained.
